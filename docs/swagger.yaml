@@ -86,3 +86,50 @@ paths:
                 properties:
                   resolved_url:
                     type: string
+
+  /get_po_token:
+    post:
+      summary: Generates a YouTube PO Token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                visitorData:
+                  type: string
+                  description: YouTube visitor data (visitorData)
+                videoId:
+                  type: string
+                  description: YouTube video ID (for video-specific PoToken)
+      responses:
+        '200':
+          description: PO Token generated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  visitorDataToken:
+                    type: string
+                    description: Visitor data binding PoToken
+                  visitorData:
+                    type: string
+                    description: Original visitor data
+                  videoIdToken:
+                    type: string
+                    description: Video ID binding PoToken
+                  expiresAt:
+                    type: string
+                    format: date-time
+                    description: Token expiration time
+        '404':
+          description: Failed to generate PO Token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
