@@ -248,6 +248,7 @@ export class PoTokenManager {
   async generatePoToken(
     visitorData?: string,
     videoId?: string,
+    client?: string,
   ): Promise<YoutubeSessionData> {
     if (!visitorData) {
       visitorData = (await this.generateVisitorData()) || undefined;
@@ -277,7 +278,8 @@ export class PoTokenManager {
 
     let videoIdToken = undefined;
     if (videoId) {
-      videoIdToken = await tokenMinter.minter.mintAsWebsafeString(videoId);
+      const bindingId = (client === "IOS" || client === "ANDROID") ? visitorData : videoId;
+      videoIdToken = await tokenMinter.minter.mintAsWebsafeString(bindingId);
     }
 
     return {

@@ -42,6 +42,7 @@ export interface ResolveUrlResponse {
 export interface PoTokenRequest {
   visitorData?: string;
   videoId?: string;
+  client?: string;
 }
 
 export interface PoTokenResponse {

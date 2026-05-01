@@ -6,10 +6,10 @@ import type {
 } from "../types.ts";
 
 export async function handleGetPoToken(ctx: RequestContext): Promise<Response> {
-  const { visitorData, videoId } = ctx.body as PoTokenRequest;
+  const { visitorData, videoId, client } = ctx.body as PoTokenRequest;
 
   try {
-    const potData = await potManager.generatePoToken(visitorData, videoId);
+    const potData = await potManager.generatePoToken(visitorData, videoId, client);
 
     const response: PoTokenResponse = {
       visitorDataToken: potData.visitorDataToken,
