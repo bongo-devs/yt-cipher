@@ -8,7 +8,7 @@ import {
   getHeaders,
   USER_AGENT,
   WebPoSignalOutput,
-} from "npm:bgutils-js";
+} from "npm:bgutils-js@3.2.0";
 import { JSDOM } from "npm:jsdom";
 import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
 
