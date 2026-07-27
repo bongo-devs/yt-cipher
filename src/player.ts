@@ -10,6 +10,7 @@ export enum PlayerVariant {
     TV_ES6 = 'TV_ES6',
     PHONE = 'PHONE',
     EMBED = "EMBED",
+    EMBED_ES6 = "EMBED_ES6",
     HOUSE = "HOUSE",
 }
 
@@ -44,6 +45,7 @@ const playerVariantDetails: VariantDetail[] = [
     new VariantDetail(PlayerVariant.TV, /^tv-player-ias\.vflset\/tv-player-ias\.js$/, () => `tv-player-ias.vflset/tv-player-ias.js`),
     new VariantDetail(PlayerVariant.TV_ES6, /^tv-player-es6\.vflset\/tv-player-es6\.js$/, () => `tv-player-es6.vflset/tv-player-es6.js`),
     new VariantDetail(PlayerVariant.EMBED, /^player_embed\.vflset\/([a-zA-Z_]+)\/base\.js$/, (region) => `player_ias.vflset/${region}/base.js`),
+    new VariantDetail(PlayerVariant.EMBED_ES6, /^player_embed_es6\.vflset\/([a-zA-Z_]+)\/base\.js$/, (region) => `player_es6.vflset/${region}/base.js`),
     new VariantDetail(PlayerVariant.HOUSE, /^house_brand_player\.vflset\/([a-zA-Z_]+)\/base\.js$/, (region) => `house_brand_player.vflset/${region}/base.js`),
 ];
 
