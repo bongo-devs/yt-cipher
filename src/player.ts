@@ -85,7 +85,8 @@ export class PlayerScript {
             }
         }
 
-        throw new Error(`Unknown player variant for URL: ${url}`);
+        console.warn(`Unknown player variant for URL: ${url}. Defaulting to IAS variant.`);
+        return new PlayerScript(id, PlayerVariant.IAS, null);
     }
 
     toUrl(): string {
