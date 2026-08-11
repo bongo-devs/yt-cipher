@@ -56,7 +56,7 @@ export async function getPlayerFilePath(playerScript: PlayerScript): Promise<str
         if (error instanceof Deno.errors.NotFound) {
             console.log(`Cache miss for player: ${playerUrl}. Fetching...`);
             const response = await fetch(playerUrl);
-            playerScriptFetches.labels({ player_url: playerUrl, status: String(response.status) }).inc();
+            playerScriptFetches.labels({ status: String(response.status) }).inc();
             if (!response.ok) {
                 throw new Error(`Failed to fetch player from ${playerUrl}: ${response.statusText}`);
             }

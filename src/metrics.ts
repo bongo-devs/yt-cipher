@@ -1,26 +1,29 @@
 import {
     Counter,
     Gauge,
-    Histogram,
     Registry,
 } from "https://deno.land/x/ts_prometheus/mod.ts";
 
 export const registry = new Registry();
 
-// Default buckets for http request duration
-const httpBuckets = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10];
-
 export const endpointHits = Counter.with({
     name: "http_requests_total",
     help: "Total number of HTTP requests.",
-    labels: ["method", "pathname", "player_id", "player_type", "plugin_version", "user_agent"],
+    labels: ["pathname", "player_id", "player_type"],
+    registry: [registry],
+});
+
+export const userAgentRequests = Counter.with({
+    name: "http_requests_by_user_agent_total",
+    help: "Total number of HTTP requests by user agent.",
+    labels: ["user_agent"],
     registry: [registry],
 });
 
 export const responseCodes = Counter.with({
     name: "http_responses_total",
     help: "Total number of HTTP responses.",
-    labels: ["method", "pathname", "status", "player_id", "player_type", "plugin_version", "user_agent"],
+    labels: ["pathname", "status", "player_id", "player_type"],
     registry: [registry],
 });
 
@@ -28,14 +31,6 @@ export const workerErrors = Counter.with({
     name: "worker_errors_total",
     help: "Total number of worker errors.",
     labels: ["player_id", "player_type", "message"],
-    registry: [registry],
-});
-
-export const endpointLatency = Histogram.with({
-    name: "http_request_duration_seconds",
-    help: "HTTP request duration in seconds.",
-    labels: ["method", "pathname", "player_id", "player_type", "cached"],
-    buckets: httpBuckets,
     registry: [registry],
 });
 
@@ -62,7 +57,7 @@ export const playerUrlRequests = Counter.with({
 
 export const playerScriptFetches = Counter.with({
     name: "player_script_fetches_total",
-    help: "Total number of player script fetches.",
-    labels: ["player_url", "status"],
+    help: "Total number of player script fetches by response status.",
+    labels: ["status"],
     registry: [registry],
 });
