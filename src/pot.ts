@@ -9,8 +9,10 @@ import {
 } from "npm:bgutils-js@3.2.0";
 // Pinned: jsdom 30 pulls undici 8, which crashes on startup under Deno
 // (`webidl.util.markAsUncloneable is not a function`).
-import { JSDOM } from "npm:jsdom@29";
+import { JSDOM, VirtualConsole } from "npm:jsdom@29";
 import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
+import { potCache, type PotCacheEntry } from "./potCache.ts";
+import { potColdStartTokens, potTokens } from "./metrics.ts";
 
 const YT_BASE = "https://www.youtube.com";
 const TV_CONFIG_URL =
@@ -50,13 +52,24 @@ interface YoutubeSessionData {
  * Clients whose poToken is **session-bound** — minted against `visitorData` rather than the video
  * id, so one token serves every video while the visitor data stays valid.
  *
- * `IOS`/`ANDROID` are the pre-signed mobile clients. `TVHTML5_SIMPLY` uses the same older
- * session-bound technique (youtube-source's `TvHtml5Simply.preparePlayback` mints against
- * `visitorData`). Every other client — `WEB`, `MWEB`, `WEB_REMIX` — is *content*-bound: its token
- * is minted against the video id and is valid only for that video. `TVHTML5` is intentionally not a
- * poToken client (no binding attests its SABR session — it plays its direct URL under OAuth).
+ * The mobile (`IOS*`, `ANDROID*`) and TV (`TVHTML5*`, `TV_SIMPLY`) families all use this older
+ * session-bound technique (e.g. youtube-source's `TvHtml5Simply.preparePlayback` mints against
+ * `visitorData`). Every other client — `WEB`, `MWEB`, `WEB_REMIX` — is *content*-bound: its token is
+ * minted against the video id and is valid only for that video.
  */
-const SESSION_BOUND_CLIENTS = new Set(["IOS", "ANDROID", "TVHTML5_SIMPLY"]);
+const SESSION_BOUND_CLIENTS = new Set(["TV_SIMPLY"]);
+
+export function isSessionBound(client?: string): boolean {
+  if (!client) return false;
+  const name = client.toUpperCase();
+  return name.startsWith("IOS") || name.startsWith("ANDROID") ||
+    name.startsWith("TVHTML5") || SESSION_BOUND_CLIENTS.has(name);
+}
+
+/** Token TTL and per-binding reuse windows for the {@link potCache}. */
+const VISITOR_TTL_MS = 6 * 60 * 60 * 1000;
+const VIDEO_REUSE_MS = 150_000;
+const VISITOR_REUSE_MS = VISITOR_TTL_MS - 5 * 60 * 1000;
 
 /** A BotGuard challenge together with the request key that produced it (they must match). */
 type ChallengeResult = {
@@ -162,17 +175,21 @@ export class PoTokenManager {
   private static readonly REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
   private static hasDom = false;
   private _minterCache: Map<string, TokenMinter> = new Map();
-  private TOKEN_TTL_HOURS = 6;
   private innertube?: Innertube;
 
   constructor() {
     if (!PoTokenManager.hasDom) {
+      const virtualConsole = new VirtualConsole().forwardTo(console, {
+        jsdomErrors: ["unhandled-exception", "resource-loading", "css-parsing"],
+      });
+
       const dom = new JSDOM(
         '<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>',
         {
           url: "https://www.youtube.com/",
           referrer: "https://www.youtube.com/",
           userAgent: USER_AGENT,
+          virtualConsole,
         },
       );
 
@@ -533,6 +550,32 @@ export class PoTokenManager {
     return tokenMinter;
   }
 
+  /**
+   * Mint a token for `binding` (visitorData or videoId), reusing a cached one minted within the last
+   * `reuseMs`. Keyed by the binding, so session- and content-bound tokens never collide. `kind`
+   * ("visitor"/"video") only labels the {@link potTokens} metric.
+   */
+  private async mint(
+    minter: any,
+    binding: string,
+    reuseMs: number,
+    kind: string,
+  ): Promise<PotCacheEntry> {
+    const cached = potCache.get(binding);
+    if (cached && Date.now() - cached.mintedAt < reuseMs) {
+      potTokens.labels({ binding: kind, result: "reused" }).inc();
+      return cached;
+    }
+
+    const token = await minter.mintAsWebsafeString(binding);
+    if (!token) throw new Error("Unexpected empty POT");
+
+    const entry: PotCacheEntry = { token, mintedAt: Date.now() };
+    potCache.set(binding, entry);
+    potTokens.labels({ binding: kind, result: "minted" }).inc();
+    return entry;
+  }
+
   async generatePoToken(
     visitorData?: string,
     videoId?: string,
@@ -559,17 +602,22 @@ export class PoTokenManager {
       );
     }
 
-    const visitorDataToken = await tokenMinter.minter.mintAsWebsafeString(
+    const visitorEntry = await this.mint(
+      tokenMinter.minter,
       visitorData,
+      VISITOR_REUSE_MS,
+      "visitor",
     );
-    if (!visitorDataToken) throw new Error("Unexpected empty POT");
 
-    let videoIdToken = undefined;
+    let videoEntry: PotCacheEntry | undefined;
     if (videoId) {
-      const bindingId = SESSION_BOUND_CLIENTS.has(client ?? "")
-        ? visitorData
-        : videoId;
-      videoIdToken = await tokenMinter.minter.mintAsWebsafeString(bindingId);
+      const sessionBound = isSessionBound(client);
+      videoEntry = await this.mint(
+        tokenMinter.minter,
+        sessionBound ? visitorData : videoId,
+        sessionBound ? VISITOR_REUSE_MS : VIDEO_REUSE_MS,
+        "video",
+      );
     }
 
     // Bound to the session, never to the video: the cold-start format carries a visitor/data-sync
@@ -579,7 +627,9 @@ export class PoTokenManager {
     if (visitorId) {
       try {
         coldStartToken = BG.PoToken.generateColdStartToken(visitorId);
+        potColdStartTokens.labels({ result: "minted" }).inc();
       } catch (e) {
+        potColdStartTokens.labels({ result: "failed" }).inc();
         console.warn(
           "Failed to create cold start token:",
           e instanceof Error ? e.message : e,
@@ -587,12 +637,17 @@ export class PoTokenManager {
       }
     }
 
+    const oldestMint = Math.min(
+      visitorEntry.mintedAt,
+      videoEntry?.mintedAt ?? Infinity,
+    );
+
     return {
-      visitorDataToken,
+      visitorDataToken: visitorEntry.token,
       visitorData,
-      videoIdToken,
+      videoIdToken: videoEntry?.token,
       coldStartToken,
-      expiresAt: new Date(Date.now() + this.TOKEN_TTL_HOURS * 60 * 60 * 1000),
+      expiresAt: new Date(oldestMint + VISITOR_TTL_MS),
     };
   }
 }
