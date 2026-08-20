@@ -61,3 +61,17 @@ export const playerScriptFetches = Counter.with({
     labels: ["status"],
     registry: [registry],
 });
+
+export const potTokens = Counter.with({
+    name: "pot_tokens_total",
+    help: "Total number of poToken mints, by binding (visitor/video) and cache result (minted/reused).",
+    labels: ["binding", "result"],
+    registry: [registry],
+});
+
+export const potColdStartTokens = Counter.with({
+    name: "pot_cold_start_tokens_total",
+    help: "Total number of cold-start poToken generations by result (minted/failed).",
+    labels: ["result"],
+    registry: [registry],
+});
