@@ -1,39 +1,162 @@
-import axios, { AxiosRequestConfig } from "npm:axios";
 import {
   BG,
   BgConfig,
   buildURL,
   DescrambledChallenge,
   FetchFunction,
-  getHeaders,
   USER_AGENT,
   WebPoSignalOutput,
 } from "npm:bgutils-js@3.2.0";
-import { JSDOM } from "npm:jsdom";
+// Pinned: jsdom 30 pulls undici 8, which crashes on startup under Deno
+// (`webidl.util.markAsUncloneable is not a function`).
+import { JSDOM } from "npm:jsdom@29";
 import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
+
+const YT_BASE = "https://www.youtube.com";
+const TV_CONFIG_URL =
+  "https://www.youtube.com/tv_config?action_get_config=true&client=lb4&theme=cl";
+const TV_USER_AGENT =
+  "Mozilla/5.0 (Linux arm64-v8a; Android 10) Cobalt/25.lts.30.1034958-gold (unlike Gecko) v8/8.8.278.17-jit gles Starboard/15, Sony_ATV_sdm845_13140765/52.1.C.0.268 (KDDI, SOV38) com.google.android.youtube.tv/5.30.301";
+const WEB_CLIENT_NAME = "WEB";
+const WEB_CLIENT_VERSION = "2.20260227.01.00";
+const GOOG_API_KEY = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw";
+
+/**
+ * BotGuard's `Create` and `GenerateIT` RPCs are each reachable on two surfaces: Google's WAA
+ * (`jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/...`) and YouTube's mirror
+ * (`youtube.com/api/jnn/v1/...`). The pairing below — challenge from WAA, integrity token from
+ * YouTube — is the one the reference generator uses and the one googlevideo's SABR path attests.
+ * bgutils-js defaults `GenerateIT` to WAA instead, which mints a token the streaming backend
+ * refuses to attest.
+ */
+const CREATE_USE_YT_API = Deno.env.get("POT_CREATE_USE_YT_API") === "true";
+const GENERATEIT_USE_YT_API =
+  Deno.env.get("POT_GENERATEIT_USE_YT_API") !== "false";
 
 interface YoutubeSessionData {
   visitorDataToken: string;
   visitorData: string;
   videoIdToken?: string;
+  /**
+   * Per-response bootstrap token, valid only while YouTube reports
+   * `StreamProtectionStatus=2` (ATTESTATION_PENDING). It embeds the current time, so it cannot be
+   * cached — it is minted fresh on every request and stops working once the status moves to 3.
+   */
+  coldStartToken?: string;
   expiresAt: Date;
 }
 
-export interface ChallengeData {
-  interpreterUrl: {
-    privateDoNotAccessOrElseTrustedResourceUrlWrappedValue: string;
-  };
-  interpreterHash: string;
-  program: string;
-  globalName: string;
-  clientExperimentsStateBlob: string;
-}
+/**
+ * Clients whose poToken is **session-bound** — minted against `visitorData` rather than the video
+ * id, so one token serves every video while the visitor data stays valid.
+ *
+ * `IOS`/`ANDROID` are the pre-signed mobile clients. `TVHTML5_SIMPLY` uses the same older
+ * session-bound technique (youtube-source's `TvHtml5Simply.preparePlayback` mints against
+ * `visitorData`). Every other client — `WEB`, `MWEB`, `WEB_REMIX` — is *content*-bound: its token
+ * is minted against the video id and is valid only for that video. `TVHTML5` is intentionally not a
+ * poToken client (no binding attests its SABR session — it plays its direct URL under OAuth).
+ */
+const SESSION_BOUND_CLIENTS = new Set(["IOS", "ANDROID", "TVHTML5_SIMPLY"]);
+
+/** A BotGuard challenge together with the request key that produced it (they must match). */
+type ChallengeResult = {
+  challenge: DescrambledChallenge;
+  requestKey: string;
+  source: string;
+};
 
 type TokenMinter = {
   expiry: Date;
   integrityToken: string;
   minter: any;
 };
+
+/** The four VM entry points BotGuard hands back through its setup callback. */
+type VmFunctions = {
+  asyncSnapshot: (callback: (response: string) => void, args: any[]) => void;
+  shutdown?: (...args: any[]) => void;
+  passEvent?: (...args: any[]) => void;
+  checkCamera?: (...args: any[]) => void;
+};
+
+/**
+ * Lenient parser for the object literals YouTube embeds in its HTML (`window.ytAtN({...})`):
+ * unquoted keys, single-quoted strings, `\xNN` escapes and trailing commas are all legal there but
+ * not in JSON.
+ */
+function parseLooseJson(input: string): any {
+  const normalized = input
+    .replace(
+      /\\x([0-9a-f]{2})/gi,
+      (_, hex) => String.fromCharCode(parseInt(hex, 16)),
+    )
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(
+      /'((?:[^'\\]|\\[\s\S])*)'/g,
+      (_, s) => JSON.stringify(s.replace(/\\'/g, "'")),
+    )
+    .replace(/([{,]\s*)([\w$]+)\s*:/g, '$1"$2":');
+
+  const parsed = JSON.parse(normalized);
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value === "string" && /^\s*[{[]/.test(value)) {
+      try {
+        parsed[key] = JSON.parse(value);
+      } catch { /* leave the raw string in place */ }
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Pull the bare visitor **ID** out of a `visitorData` blob.
+ *
+ * The cold-start packet binds to the visitor ID (or data-sync ID), not to the `visitorData`
+ * protobuf that wraps it: bgutils caps the binding at 118 bytes and a full blob always exceeds
+ * that. Field 1 of the protobuf is the visitor ID string, so decoding just that field is enough.
+ */
+function visitorIdFrom(visitorData: string): string | undefined {
+  try {
+    const b64 = decodeURIComponent(visitorData)
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+
+    // Tag 0x0a = field 1, wire type 2 (length-delimited), followed by a single-byte length.
+    if (bytes[0] !== 0x0a) return undefined;
+    const length = bytes[1];
+    if (!length || bytes.length < 2 + length) return undefined;
+    return new TextDecoder().decode(bytes.subarray(2, 2 + length));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Normalise the several shapes YouTube returns a `bgChallenge` in into one. */
+function toDescrambledChallenge(
+  bgChallenge: any,
+): DescrambledChallenge | undefined {
+  if (!bgChallenge?.program || !bgChallenge?.globalName) return undefined;
+  return {
+    messageId: bgChallenge.messageId,
+    program: bgChallenge.program,
+    globalName: bgChallenge.globalName,
+    interpreterHash: bgChallenge.interpreterHash ?? "",
+    interpreterJavascript: {
+      privateDoNotAccessOrElseSafeScriptWrappedValue:
+        bgChallenge.interpreterJavascript
+          ?.privateDoNotAccessOrElseSafeScriptWrappedValue ?? null,
+      privateDoNotAccessOrElseTrustedResourceUrlWrappedValue:
+        bgChallenge.interpreterUrl
+          ?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue ??
+          bgChallenge.interpreterJavascript
+            ?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue ??
+          null,
+    },
+    clientExperimentsStateBlob: bgChallenge.clientExperimentsStateBlob,
+  };
+}
 
 export class PoTokenManager {
   private static readonly REQUEST_KEY = "O43z0dpjhgX20SCx4KAo";
@@ -82,94 +205,292 @@ export class PoTokenManager {
     }
   }
 
+  /**
+   * The challenge program and the request key sent to `GenerateIT` must come from the *same*
+   * handshake — the key is a lookup into the server-side program descriptor table, so pairing a
+   * program from one surface with a key from another yields an integrity token YouTube's streaming
+   * backend will not attest (it mints fine, then parks the SABR session at
+   * `StreamProtectionStatus=2`). Each source below therefore returns its own key alongside its
+   * challenge.
+   *
+   * Ordered by observed success rate, mirroring the reference generator: the home page carries the
+   * live challenge (and lets us populate `yt.config_` for the VM), the TV config carries an explicit
+   * `challengeRequestKey`, WAA `Create` is the canonical WebPO handshake, and Innertube `att/get`
+   * is a last resort — it answers the *engagement* attestation flow rather than the WebPO one.
+   */
   private async getDescrambledChallenge(
     bgConfig: BgConfig,
     innertubeContext?: InnertubeContext,
-  ): Promise<DescrambledChallenge> {
-    try {
-      if (!innertubeContext) {
-        const innertube = await this.getInnertube();
-        innertubeContext = innertube.session.context;
+  ): Promise<ChallengeResult> {
+    const attempts: Array<() => Promise<ChallengeResult | undefined>> = [
+      () => this.challengeFromHomePage(bgConfig),
+      () => this.challengeFromTvConfig(bgConfig),
+      () => this.challengeFromWaa(bgConfig),
+      () => this.challengeFromAttGet(bgConfig, innertubeContext),
+    ];
+
+    for (const attempt of attempts) {
+      try {
+        const result = await attempt();
+        if (result) {
+          console.log(
+            `BotGuard challenge acquired from ${result.source} (globalName=${result.challenge.globalName})`,
+          );
+          return result;
+        }
+      } catch (e) {
+        console.warn(
+          "BotGuard challenge source failed:",
+          e instanceof Error ? e.message : e,
+        );
       }
-      if (!innertubeContext) throw new Error("Innertube context unavailable");
-
-      const attGetResponse = await bgConfig.fetch(
-        "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false",
-        {
-          method: "POST",
-          headers: {
-            ...getHeaders(),
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            context: innertubeContext,
-            engagementType: "ENGAGEMENT_TYPE_UNBOUND",
-          }),
-        },
-      );
-      const attestation = await attGetResponse.json();
-      const challenge = attestation.bgChallenge as ChallengeData;
-
-      const { program, globalName, interpreterHash } = challenge;
-      const { privateDoNotAccessOrElseTrustedResourceUrlWrappedValue } =
-        challenge.interpreterUrl;
-
-      const interpreterJSResponse = await bgConfig.fetch(
-        `https:${privateDoNotAccessOrElseTrustedResourceUrlWrappedValue}`,
-      );
-      const interpreterJS = await interpreterJSResponse.text();
-
-      return {
-        program,
-        globalName,
-        interpreterHash,
-        interpreterJavascript: {
-          privateDoNotAccessOrElseSafeScriptWrappedValue: interpreterJS,
-          privateDoNotAccessOrElseTrustedResourceUrlWrappedValue,
-        },
-      };
-    } catch (e) {
-      console.warn(
-        "Failed to get challenge from Innertube, falling back to BG.Challenge.create",
-        e,
-      );
-      const descrambledChallenge = await BG.Challenge.create(bgConfig);
-      if (descrambledChallenge) return descrambledChallenge;
-      throw new Error("Could not get Botguard challenge");
     }
+
+    throw new Error("Could not get Botguard challenge");
+  }
+
+  /** The YouTube home page: `ytcfg.set({...})` plus the inline `window.ytAtN({R: ...})`. */
+  private async challengeFromHomePage(
+    bgConfig: BgConfig,
+  ): Promise<ChallengeResult | undefined> {
+    const response = await bgConfig.fetch(YT_BASE, {
+      headers: {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.7",
+        "user-agent": USER_AGENT,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`youtube.com returned ${response.status}`);
+    }
+    const html = await response.text();
+
+    // The VM reads experiment flags and the client config out of `yt.config_`.
+    const config = html.match(/ytcfg\.set\(({.+?})\);/s)?.[1];
+    if (config) {
+      const yt = { config_: JSON.parse(config) };
+      (globalThis as any).window.yt = yt;
+      (globalThis as any).yt = yt;
+    }
+
+    const attestation = html.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
+    if (!attestation) return undefined;
+
+    const challenge = toDescrambledChallenge(
+      parseLooseJson(attestation[1]).R?.bgChallenge,
+    );
+    if (!challenge) return undefined;
+    return {
+      challenge,
+      requestKey: PoTokenManager.REQUEST_KEY,
+      source: "home page",
+    };
+  }
+
+  /** The TV config endpoint, which names its own `challengeRequestKey`. */
+  private async challengeFromTvConfig(
+    bgConfig: BgConfig,
+  ): Promise<ChallengeResult | undefined> {
+    const response = await bgConfig.fetch(TV_CONFIG_URL, {
+      headers: { "accept": "*/*", "user-agent": TV_USER_AGENT },
+    });
+    if (!response.ok) throw new Error(`tv_config returned ${response.status}`);
+    const text = await response.text();
+    // The response is JSON behind an anti-hijacking `)]}` guard.
+    if (!text.startsWith(")]}")) {
+      throw new Error("invalid yt tv_config response");
+    }
+
+    const json = JSON.parse(text.slice(4));
+    if (!json.challengeParams?.R) return undefined;
+
+    const challenge = toDescrambledChallenge(
+      JSON.parse(json.challengeParams.R).bgChallenge,
+    );
+    if (!challenge) return undefined;
+    return {
+      challenge,
+      requestKey: json.challengeRequestKey || PoTokenManager.REQUEST_KEY,
+      source: "tv_config",
+    };
+  }
+
+  /** The canonical WebPO handshake: `Create` on Google's WAA service. */
+  private async challengeFromWaa(
+    bgConfig: BgConfig,
+  ): Promise<ChallengeResult | undefined> {
+    const challenge = await BG.Challenge.create({
+      ...bgConfig,
+      useYouTubeAPI: CREATE_USE_YT_API,
+    });
+    if (!challenge?.program || !challenge?.globalName) return undefined;
+    return {
+      challenge,
+      requestKey: bgConfig.requestKey,
+      source: CREATE_USE_YT_API ? "youtube Create" : "WAA Create",
+    };
+  }
+
+  /**
+   * Innertube `att/get`. Kept last: it answers the engagement-attestation flow, so its program does
+   * not necessarily correspond to the WebPO request key we send to `GenerateIT`.
+   */
+  private async challengeFromAttGet(
+    bgConfig: BgConfig,
+    innertubeContext?: InnertubeContext,
+  ): Promise<ChallengeResult | undefined> {
+    if (!innertubeContext) {
+      const innertube = await this.getInnertube();
+      innertubeContext = innertube.session.context;
+    }
+    const context = innertubeContext ?? {
+      client: {
+        clientName: WEB_CLIENT_NAME,
+        clientVersion: WEB_CLIENT_VERSION,
+      },
+    };
+
+    const response = await bgConfig.fetch(
+      `${YT_BASE}/youtubei/v1/att/get?prettyPrint=false`,
+      {
+        method: "POST",
+        headers: {
+          "accept": "*/*",
+          "content-type": "application/json",
+          "user-agent": USER_AGENT,
+          "x-goog-api-key": GOOG_API_KEY,
+        },
+        body: JSON.stringify({
+          context,
+          engagementType: "ENGAGEMENT_TYPE_UNBOUND",
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(`att/get returned ${response.status}`);
+
+    const attestation = await response.json();
+    const challenge = toDescrambledChallenge(attestation?.bgChallenge);
+    if (!challenge) return undefined;
+    return {
+      challenge,
+      requestKey: PoTokenManager.REQUEST_KEY,
+      source: "att/get",
+    };
+  }
+
+  /**
+   * Load the BotGuard interpreter and take a snapshot.
+   *
+   * The VM's init function `a` is called with the nine arguments the current program expects
+   * (telemetry callback, snapshot-mode flag and the logger table included). bgutils-js 3.2.0's own
+   * `BotGuardClient` still passes six, which the current VM accepts without throwing while
+   * producing a snapshot the streaming backend refuses to attest — so the call is made directly
+   * here instead.
+   */
+  private async loadVm(
+    challenge: DescrambledChallenge,
+    globalObj: Record<string, any>,
+    fetchFn: FetchFunction,
+  ): Promise<{ snapshot: (args: any) => Promise<string> }> {
+    const inline = challenge.interpreterJavascript
+      ?.privateDoNotAccessOrElseSafeScriptWrappedValue;
+    const url = challenge.interpreterJavascript
+      ?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
+
+    const interpreter = inline ||
+      (url
+        ? await (await fetchFn(url.startsWith("http") ? url : `https:${url}`))
+          .text()
+        : "");
+    if (!interpreter) throw new Error("Could not load VM");
+
+    new Function(interpreter)();
+
+    const vm = globalObj[challenge.globalName];
+    if (!vm) throw new Error("BotGuard VM unavailable");
+    if (!vm.a) throw new Error("BotGuard VM init function unavailable");
+
+    let resolveVmFunctions!: (value: VmFunctions) => void;
+    const vmFunctions = new Promise<VmFunctions>((resolve) => {
+      resolveVmFunctions = resolve;
+    });
+
+    const vmSetupCallback = (
+      asyncSnapshot: VmFunctions["asyncSnapshot"],
+      shutdown: VmFunctions["shutdown"],
+      passEvent: VmFunctions["passEvent"],
+      checkCamera: VmFunctions["checkCamera"],
+    ) =>
+      resolveVmFunctions({ asyncSnapshot, shutdown, passEvent, checkCamera });
+
+    // The VM's Clearcut telemetry hooks (event log, client error count, payload size, latency,
+    // event count). It calls them positionally, so all five must be present.
+    const loggerFunctions = [() => {}, () => {}, () => {}, () => {}, () => {}];
+
+    await vm.a(
+      challenge.program,
+      vmSetupCallback,
+      true,
+      undefined,
+      () => {},
+      [[], []],
+      undefined,
+      false,
+      loggerFunctions,
+    );
+
+    return {
+      snapshot: async (args: any) => {
+        const { asyncSnapshot } = await vmFunctions;
+        return await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error("VM operation timed out")),
+            10_000,
+          );
+          asyncSnapshot((response: string) => {
+            clearTimeout(timer);
+            resolve(response);
+          }, [
+            args.contentBinding,
+            args.signedTimestamp,
+            args.webPoSignalOutput,
+            args.skipPrivacyBuffer,
+          ]);
+        });
+      },
+    };
   }
 
   private async generateTokenMinter(
     bgConfig: BgConfig,
     innertubeContext?: InnertubeContext,
   ): Promise<TokenMinter> {
-    const descrambledChallenge = await this.getDescrambledChallenge(
+    const { challenge, requestKey } = await this.getDescrambledChallenge(
       bgConfig,
       innertubeContext,
     );
 
-    const { program, globalName } = descrambledChallenge;
-    const interpreterJavascript = descrambledChallenge.interpreterJavascript
-      ?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-
-    if (interpreterJavascript) {
-      new Function(interpreterJavascript)();
-    } else throw new Error("Could not load VM");
-
-    const bgClient = await BG.BotGuardClient.create({
-      program,
-      globalName,
-      globalObj: bgConfig.globalObj,
-    });
+    const vm = await this.loadVm(challenge, bgConfig.globalObj, bgConfig.fetch);
 
     const webPoSignalOutput: WebPoSignalOutput = [];
-    const botguardResponse = await bgClient.snapshot({ webPoSignalOutput });
+    const botguardResponse = await vm.snapshot({ webPoSignalOutput });
 
-    const integrityTokenResp = await bgConfig.fetch(buildURL("GenerateIT"), {
-      method: "POST",
-      headers: getHeaders(),
-      body: JSON.stringify([PoTokenManager.REQUEST_KEY, botguardResponse]),
-    });
+    const integrityTokenResp = await bgConfig.fetch(
+      buildURL("GenerateIT", GENERATEIT_USE_YT_API),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json+protobuf",
+          "x-goog-api-key": GOOG_API_KEY,
+          "x-user-agent": "grpc-web-javascript/0.1",
+          "user-agent": USER_AGENT,
+        },
+        body: JSON.stringify([requestKey, botguardResponse]),
+      },
+    );
+    if (!integrityTokenResp.ok) {
+      throw new Error(`GenerateIT returned ${integrityTokenResp.status}`);
+    }
 
     const [
       integrityToken,
@@ -187,8 +508,16 @@ export class PoTokenManager {
 
     if (!integrityToken) throw new Error("Unexpected empty integrity token");
 
+    // Retire the minter a little before the server-stated TTL rather than exactly on it, so an
+    // in-flight mint never lands on an expired integrity token.
+    const ttlSecs = Number(estimatedTtlSecs);
+    const lifetimeSecs = Math.max(
+      1,
+      (Number.isFinite(ttlSecs) && ttlSecs > 0 ? ttlSecs : 300) - 30,
+    );
+
     const tokenMinter: TokenMinter = {
-      expiry: new Date(Date.now() + estimatedTtlSecs * 1000),
+      expiry: new Date(Date.now() + lifetimeSecs * 1000),
       integrityToken,
       minter: await BG.WebPoMinter.create(
         integrityTokenData,
@@ -196,53 +525,12 @@ export class PoTokenManager {
       ),
     };
 
+    console.log(
+      `BotGuard integrity token minted (ttl=${ttlSecs}s, expires=${tokenMinter.expiry.toISOString()})`,
+    );
+
     this._minterCache.set("default", tokenMinter);
     return tokenMinter;
-  }
-
-  private normalizeHeaders(
-    headers?: HeadersInit,
-  ): Record<string, string> | undefined {
-    if (!headers) return undefined;
-    if (headers instanceof Headers) {
-      return Object.fromEntries(headers.entries());
-    }
-    if (Array.isArray(headers)) {
-      return Object.fromEntries(headers);
-    }
-    return headers as Record<string, string>;
-  }
-
-  private getFetch(): FetchFunction {
-    return async (
-      input: URL | RequestInfo,
-      options?: RequestInit,
-    ): Promise<any> => {
-      const url = typeof input === "string"
-        ? input
-        : input instanceof URL
-        ? input.toString()
-        : input.url;
-      const method = (options?.method || "GET").toUpperCase();
-      const axiosOpt: AxiosRequestConfig = {
-        headers: this.normalizeHeaders(options?.headers),
-      };
-
-      const response =
-        await (method === "GET"
-          ? axios.get(url, axiosOpt)
-          : axios.post(url, options?.body, axiosOpt));
-
-      return {
-        ok: response.status >= 200 && response.status < 300,
-        status: response.status,
-        json: async () => response.data,
-        text: async () =>
-          typeof response.data === "string"
-            ? response.data
-            : JSON.stringify(response.data),
-      };
-    };
   }
 
   async generatePoToken(
@@ -256,7 +544,7 @@ export class PoTokenManager {
     }
 
     const bgConfig: BgConfig = {
-      fetch: this.getFetch(),
+      fetch: (input, init) => fetch(input, init),
       globalObj: globalThis as any,
       identifier: visitorData,
       requestKey: PoTokenManager.REQUEST_KEY,
@@ -278,14 +566,32 @@ export class PoTokenManager {
 
     let videoIdToken = undefined;
     if (videoId) {
-      const bindingId = (client === "IOS" || client === "ANDROID") ? visitorData : videoId;
+      const bindingId = SESSION_BOUND_CLIENTS.has(client ?? "")
+        ? visitorData
+        : videoId;
       videoIdToken = await tokenMinter.minter.mintAsWebsafeString(bindingId);
+    }
+
+    // Bound to the session, never to the video: the cold-start format carries a visitor/data-sync
+    // identifier. Minted per response because the packet embeds the current time.
+    let coldStartToken: string | undefined;
+    const visitorId = visitorIdFrom(visitorData);
+    if (visitorId) {
+      try {
+        coldStartToken = BG.PoToken.generateColdStartToken(visitorId);
+      } catch (e) {
+        console.warn(
+          "Failed to create cold start token:",
+          e instanceof Error ? e.message : e,
+        );
+      }
     }
 
     return {
       visitorDataToken,
       visitorData,
       videoIdToken,
+      coldStartToken,
       expiresAt: new Date(Date.now() + this.TOKEN_TTL_HOURS * 60 * 60 * 1000),
     };
   }
