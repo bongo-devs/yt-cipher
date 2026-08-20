@@ -120,6 +120,12 @@ paths:
                   videoIdToken:
                     type: string
                     description: Video ID binding PoToken
+                  coldStartToken:
+                    type: string
+                    description: >-
+                      Bootstrap token accepted only while a SABR session reports
+                      StreamProtectionStatus=2 (attestation pending). Embeds the current time, so it
+                      must not be cached.
                   expiresAt:
                     type: string
                     format: date-time

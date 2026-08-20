@@ -9,12 +9,17 @@ export async function handleGetPoToken(ctx: RequestContext): Promise<Response> {
   const { visitorData, videoId, client } = ctx.body as PoTokenRequest;
 
   try {
-    const potData = await potManager.generatePoToken(visitorData, videoId, client);
+    const potData = await potManager.generatePoToken(
+      visitorData,
+      videoId,
+      client,
+    );
 
     const response: PoTokenResponse = {
       visitorDataToken: potData.visitorDataToken,
       visitorData: potData.visitorData,
       videoIdToken: potData.videoIdToken,
+      coldStartToken: potData.coldStartToken,
       expiresAt: potData.expiresAt.toISOString(),
     };
 
