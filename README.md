@@ -91,6 +91,7 @@ Environment Variables:
 
 - `OVERRIDE_PLAYER_ID` - Forces all requests to use a specific YouTube player script ID (eg. 1a2b3c4d).
 - `OVERRIDE_PLAYER_VARIANT` - Forces all requests to use a specific player variant. Available variants: `IAS`, `IAS_TCC`, `IAS_TCE`, `ES5`, `ES6`, `TV`, `TV_ES6`, `PHONE`, `EMBED`.
+- `POT_CACHE_SIZE` - Max number of minted PO tokens kept in memory. Default: `200`
 
 ## IPv6 Support
 
@@ -218,3 +219,46 @@ Resolves a raw stream URL by handling the signature and n-parameter decryption, 
   "resolved_url": "..."
 }
 ```
+
+### `POST /get_po_token`
+
+Mints a PO Token (proof of origin). Returns two tokens so the caller can pick the one its innertube client needs.
+
+**Request Body:**
+
+```json
+{
+  "visitorData": "...",
+  "videoId": "...",
+  "client": "MWEB"
+}
+```
+
+- `visitorData` (string, optional): Existing visitor data to bind against. Generated for you if omitted.
+- `videoId` (string, optional): Video ID to bind against. Omit it and only `visitorDataToken` is returned.
+- `client` (string, optional): Innertube client name, case insensitive. Only affects what `videoIdToken` is bound to.
+
+**Successful Response:**
+
+```json
+{
+  "visitorDataToken": "...",
+  "visitorData": "...",
+  "videoIdToken": "...",
+  "expiresAt": "2026-01-01T00:00:00.000Z"
+}
+```
+
+- `visitorDataToken` is always bound to `visitorData` (session bound).
+- `videoIdToken` is bound to `videoId` (content bound), **except** for session bound clients where it is bound to `visitorData` instead — in that case it is the same value as `visitorDataToken`.
+- `expiresAt` is measured from mint time, so it never overstates how much life a cached token has left.
+
+**Which token to use:**
+
+| Client | Use |
+| --- | --- |
+| `WEB`, `MWEB`, `WEB_REMIX` | `videoIdToken` (content bound) |
+| Any `IOS*` or `ANDROID*` | `visitorDataToken` |
+| `TVHTML5`, `TVHTML5_SIMPLY`, `TV_SIMPLY` | `visitorDataToken` |
+
+Pass the matching `client` value and `videoIdToken` will already be bound correctly, so you can always just read `videoIdToken`.

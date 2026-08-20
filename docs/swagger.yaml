@@ -103,6 +103,13 @@ paths:
                 videoId:
                   type: string
                   description: YouTube video ID (for video-specific PoToken)
+                client:
+                  type: string
+                  description: >-
+                    Innertube client name. Session bound clients (any IOS*, ANDROID* or
+                    TVHTML5* client, plus TV_SIMPLY) get a videoIdToken bound to
+                    visitorData instead of videoId. Any other value, or omitting the
+                    field, binds videoIdToken to videoId. Case insensitive.
       responses:
         '200':
           description: PO Token generated successfully
@@ -120,12 +127,6 @@ paths:
                   videoIdToken:
                     type: string
                     description: Video ID binding PoToken
-                  coldStartToken:
-                    type: string
-                    description: >-
-                      Bootstrap token accepted only while a SABR session reports
-                      StreamProtectionStatus=2 (attestation pending). Embeds the current time, so it
-                      must not be cached.
                   expiresAt:
                     type: string
                     format: date-time
