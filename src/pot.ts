@@ -7,8 +7,6 @@ import {
   USER_AGENT,
   WebPoSignalOutput,
 } from "npm:bgutils-js@3.2.0";
-// Pinned: jsdom 30 pulls undici 8, which crashes on startup under Deno
-// (`webidl.util.markAsUncloneable is not a function`).
 import { JSDOM, VirtualConsole } from "npm:jsdom@29";
 import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
 import { potCache, type PotCacheEntry } from "./potCache.ts";
@@ -23,14 +21,6 @@ const WEB_CLIENT_NAME = "WEB";
 const WEB_CLIENT_VERSION = "2.20260227.01.00";
 const GOOG_API_KEY = "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw";
 
-/**
- * BotGuard's `Create` and `GenerateIT` RPCs are each reachable on two surfaces: Google's WAA
- * (`jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/...`) and YouTube's mirror
- * (`youtube.com/api/jnn/v1/...`). The pairing below — challenge from WAA, integrity token from
- * YouTube — is the one the reference generator uses and the one googlevideo's SABR path attests.
- * bgutils-js defaults `GenerateIT` to WAA instead, which mints a token the streaming backend
- * refuses to attest.
- */
 const CREATE_USE_YT_API = Deno.env.get("POT_CREATE_USE_YT_API") === "true";
 const GENERATEIT_USE_YT_API =
   Deno.env.get("POT_GENERATEIT_USE_YT_API") !== "false";
@@ -39,24 +29,10 @@ interface YoutubeSessionData {
   visitorDataToken: string;
   visitorData: string;
   videoIdToken?: string;
-  /**
-   * Per-response bootstrap token, valid only while YouTube reports
-   * `StreamProtectionStatus=2` (ATTESTATION_PENDING). It embeds the current time, so it cannot be
-   * cached — it is minted fresh on every request and stops working once the status moves to 3.
-   */
   coldStartToken?: string;
   expiresAt: Date;
 }
 
-/**
- * Clients whose poToken is **session-bound** — minted against `visitorData` rather than the video
- * id, so one token serves every video while the visitor data stays valid.
- *
- * The mobile (`IOS*`, `ANDROID*`) and TV (`TVHTML5*`, `TV_SIMPLY`) families all use this older
- * session-bound technique (e.g. youtube-source's `TvHtml5Simply.preparePlayback` mints against
- * `visitorData`). Every other client — `WEB`, `MWEB`, `WEB_REMIX` — is *content*-bound: its token is
- * minted against the video id and is valid only for that video.
- */
 const SESSION_BOUND_CLIENTS = new Set(["TV_SIMPLY"]);
 
 export function isSessionBound(client?: string): boolean {

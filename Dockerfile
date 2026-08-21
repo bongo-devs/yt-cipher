@@ -1,4 +1,4 @@
-FROM denoland/deno:latest AS builder
+FROM --platform=$BUILDPLATFORM denoland/deno:latest AS builder
 
 WORKDIR /usr/src/app
 
@@ -19,8 +19,15 @@ RUN rm -rf ./ejs/.git ./ejs/node_modules || true
 
 COPY . .
 
-RUN deno compile \
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) TARGET=x86_64-unknown-linux-gnu ;; \
+      arm64) TARGET=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    deno compile \
     --no-check \
+    --target "$TARGET" \
     --output server \
     --allow-net --allow-read --allow-write --allow-env \
     --include worker.ts \
