@@ -4,11 +4,12 @@ import {
   buildURL,
   DescrambledChallenge,
   FetchFunction,
+  SnapshotArgs,
   USER_AGENT,
   WebPoSignalOutput,
 } from "npm:bgutils-js@3.2.0";
 import { JSDOM, VirtualConsole } from "npm:jsdom@29";
-import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js";
+import { type Context as InnertubeContext, Innertube } from "npm:youtubei.js@16.0.1";
 import type { PotTokens } from "./potCache.ts";
 import { isSessionBound } from "./potBinding.ts";
 
@@ -32,25 +33,46 @@ type ChallengeResult = {
   source: string;
 };
 
+type Minter = Awaited<ReturnType<typeof BG.WebPoMinter.create>>;
+
 type TokenMinter = {
   expiry: Date;
   integrityToken: string;
-  minter: any;
+  minter: Minter;
 };
 
 /** The four VM entry points BotGuard hands back through its setup callback. */
 type VmFunctions = {
-  asyncSnapshot: (callback: (response: string) => void, args: any[]) => void;
-  shutdown?: (...args: any[]) => void;
-  passEvent?: (...args: any[]) => void;
-  checkCamera?: (...args: any[]) => void;
+  asyncSnapshot: (
+    callback: (response: string) => void,
+    args: unknown[],
+  ) => void;
+  shutdown?: (...args: unknown[]) => void;
+  passEvent?: (...args: unknown[]) => void;
+  checkCamera?: (...args: unknown[]) => void;
+};
+
+/** A `bgChallenge` as YouTube inlines it, before it is folded into a `DescrambledChallenge`. */
+type RawBgChallenge = {
+  messageId?: string;
+  program?: string;
+  globalName?: string;
+  interpreterHash?: string;
+  clientExperimentsStateBlob?: string;
+  interpreterJavascript?: {
+    privateDoNotAccessOrElseSafeScriptWrappedValue?: string | null;
+    privateDoNotAccessOrElseTrustedResourceUrlWrappedValue?: string | null;
+  };
+  interpreterUrl?: {
+    privateDoNotAccessOrElseTrustedResourceUrlWrappedValue?: string | null;
+  };
 };
 
 /**
  * Parse the object literals YouTube inlines in its HTML. Unquoted keys, single-quoted strings,
  * `\xNN` escapes and trailing commas are legal there but not in JSON.
  */
-function parseLooseJson(input: string): any {
+function parseLooseJson(input: string): Record<string, unknown> {
   const normalized = input
     .replace(
       /\\x([0-9a-f]{2})/gi,
@@ -76,7 +98,7 @@ function parseLooseJson(input: string): any {
 
 /** Fold the several shapes of a `bgChallenge` into one. */
 function toDescrambledChallenge(
-  bgChallenge: any,
+  bgChallenge: RawBgChallenge | undefined,
 ): DescrambledChallenge | undefined {
   if (!bgChallenge?.program || !bgChallenge?.globalName) return undefined;
   return {
@@ -216,16 +238,21 @@ export class PoTokenManager {
     const config = html.match(/ytcfg\.set\(({.+?})\);/s)?.[1];
     if (config) {
       const yt = { config_: JSON.parse(config) };
-      (globalThis as any).window.yt = yt;
-      (globalThis as any).yt = yt;
+      const global = globalThis as unknown as {
+        window: Record<string, unknown>;
+        yt?: unknown;
+      };
+      global.window.yt = yt;
+      global.yt = yt;
     }
 
     const attestation = html.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
     if (!attestation) return undefined;
 
-    const challenge = toDescrambledChallenge(
-      parseLooseJson(attestation[1]).R?.bgChallenge,
-    );
+    const attested = parseLooseJson(attestation[1]) as {
+      R?: { bgChallenge?: RawBgChallenge };
+    };
+    const challenge = toDescrambledChallenge(attested.R?.bgChallenge);
     if (!challenge) return undefined;
     return {
       challenge,
@@ -332,9 +359,9 @@ export class PoTokenManager {
    */
   private async loadVm(
     challenge: DescrambledChallenge,
-    globalObj: Record<string, any>,
+    globalObj: BgConfig["globalObj"],
     fetchFn: FetchFunction,
-  ): Promise<{ snapshot: (args: any) => Promise<string> }> {
+  ): Promise<{ snapshot: (args: SnapshotArgs) => Promise<string> }> {
     const inline = challenge.interpreterJavascript
       ?.privateDoNotAccessOrElseSafeScriptWrappedValue;
     const url = challenge.interpreterJavascript
@@ -382,7 +409,7 @@ export class PoTokenManager {
     );
 
     return {
-      snapshot: async (args: any) => {
+      snapshot: async (args: SnapshotArgs) => {
         const { asyncSnapshot } = await vmFunctions;
         return await new Promise<string>((resolve, reject) => {
           const timer = setTimeout(
@@ -478,6 +505,7 @@ export class PoTokenManager {
     visitorData?: string,
     videoId?: string,
     client?: string,
+    contentBinding?: string,
   ): Promise<PotTokens> {
     if (!visitorData) {
       visitorData = (await this.generateVisitorData()) || undefined;
@@ -486,7 +514,7 @@ export class PoTokenManager {
 
     const bgConfig: BgConfig = {
       fetch: (input, init) => fetch(input, init),
-      globalObj: globalThis as any,
+      globalObj: globalThis as unknown as BgConfig["globalObj"],
       identifier: visitorData,
       requestKey: PoTokenManager.REQUEST_KEY,
     };
@@ -502,18 +530,27 @@ export class PoTokenManager {
 
     const visitorDataToken = await mint(tokenMinter.minter, visitorData);
 
-    // A session bound client binds its video token to visitorData, so it is the visitor token.
-    const videoIdToken = !videoId
-      ? undefined
-      : isSessionBound(client)
-      ? visitorDataToken
-      : await mint(tokenMinter.minter, videoId);
+    // TVHTML5 binds to a living room nonce that is neither the videoId nor the visitorData, so an
+    // explicit binding overrides what the client name would otherwise imply.
+    const binding = contentBinding ??
+      (!videoId ? undefined : isSessionBound(client) ? visitorData : videoId);
 
-    return { visitorDataToken, visitorData, videoIdToken };
+    const videoIdToken = !binding
+      ? undefined
+      : binding === visitorData
+      ? visitorDataToken
+      : await mint(tokenMinter.minter, binding);
+
+    return {
+      visitorDataToken,
+      visitorData,
+      videoIdToken,
+      contentBinding: binding,
+    };
   }
 }
 
-async function mint(minter: any, binding: string): Promise<string> {
+async function mint(minter: Minter, binding: string): Promise<string> {
   const token = await minter.mintAsWebsafeString(binding);
   if (!token) throw new Error("Unexpected empty POT");
   return token;

@@ -22,6 +22,7 @@ export async function handleGeneratePotoken(
       visitorDataToken: potData.visitorDataToken,
       visitorData: potData.visitorData,
       videoIdToken: potData.videoIdToken,
+      contentBinding: potData.contentBinding,
       // Not cached: the packet embeds the current time.
       coldStartToken: coldStartToken(potData.visitorData),
       expiresAt: potData.expiresAt.toISOString(),

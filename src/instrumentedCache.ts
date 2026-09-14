@@ -1,5 +1,5 @@
 import { cacheSize } from "./metrics.ts";
-import { LruCache } from "jsr:@std/cache";
+import { LruCache } from "jsr:@std/cache@0.2.1";
 
 export class InstrumentedLRU<T> extends LruCache<string, T> {
     constructor(private cacheName: string, maxSize: number) {

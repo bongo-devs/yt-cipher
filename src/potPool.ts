@@ -153,14 +153,25 @@ function dispatch(req: PoTokenRequest): Promise<PotTokens> {
  * so its videoId only decides whether one was asked for. An empty visitorData means the worker's
  * own session, which is stable for the worker's lifetime.
  */
-export function cacheKey({ visitorData, videoId, client }: PoTokenRequest) {
-  const video = !videoId ? "-" : isSessionBound(client) ? "session" : videoId;
+export function cacheKey(
+  { visitorData, videoId, client, contentBinding }: PoTokenRequest,
+) {
+  const video = contentBinding
+    ? `bound:${contentBinding}`
+    : !videoId
+    ? "-"
+    : isSessionBound(client)
+    ? "session"
+    : videoId;
   return `${visitorData ?? ""}|${video}`;
 }
 
 /** Content bound tokens go stale in minutes; session bound ones last as long as the visitorData. */
-export function reuseMs({ videoId, client }: PoTokenRequest): number {
-  return videoId && !isSessionBound(client) ? VIDEO_REUSE_MS : VISITOR_REUSE_MS;
+export function reuseMs(
+  { videoId, client, contentBinding }: PoTokenRequest,
+): number {
+  const contentBound = contentBinding || (videoId && !isSessionBound(client));
+  return contentBound ? VIDEO_REUSE_MS : VISITOR_REUSE_MS;
 }
 
 export async function generatePotoken(req: PoTokenRequest): Promise<PotResult> {
@@ -192,7 +203,7 @@ function result(
   outcome: string,
 ): PotResult {
   potTokens.labels({ binding: "visitor", result: outcome }).inc();
-  if (req.videoId) {
+  if (req.videoId || req.contentBinding) {
     potTokens.labels({ binding: "video", result: outcome }).inc();
   }
 
@@ -200,6 +211,7 @@ function result(
     visitorDataToken: entry.visitorDataToken,
     visitorData: entry.visitorData,
     videoIdToken: entry.videoIdToken,
+    contentBinding: entry.contentBinding,
     expiresAt: new Date(entry.mintedAt + VISITOR_TTL_MS),
   };
 }

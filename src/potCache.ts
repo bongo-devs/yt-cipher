@@ -5,6 +5,7 @@ export interface PotTokens {
   visitorDataToken: string;
   visitorData: string;
   videoIdToken?: string;
+  contentBinding?: string;
 }
 
 export interface PotCacheEntry extends PotTokens {

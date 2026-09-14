@@ -1,8 +1,3 @@
-import type {
-  Input as MainInput,
-  Output as MainOutput,
-} from "../ejs/src/yt/solver/main.ts";
-
 export interface Solvers {
   n: ((val: string) => string) | null;
   sig: ((val: string) => string) | null;
@@ -43,12 +38,16 @@ export interface PoTokenRequest {
   visitorData?: string;
   videoId?: string;
   client?: string;
+  /** Binds the content token to an arbitrary string instead of the videoId. */
+  contentBinding?: string;
 }
 
 export interface PoTokenResponse {
   visitorDataToken: string;
   visitorData: string;
   videoIdToken?: string;
+  /** What `videoIdToken` is bound to, which is not the videoId for every client. */
+  contentBinding?: string;
   /** Only valid while a SABR session reports `StreamProtectionStatus=2`. Never cached. */
   coldStartToken?: string;
   expiresAt: string;
@@ -61,7 +60,7 @@ export interface WorkerWithStatus extends Worker {
 export interface Task {
   data: string;
   resolve: (output: string) => void;
-  reject: (error: any) => void;
+  reject: (error: unknown) => void;
 }
 
 export type ApiRequest =
@@ -69,6 +68,9 @@ export type ApiRequest =
   | StsRequest
   | ResolveUrlRequest
   | PoTokenRequest;
+
+/** The requests that name a player script. `withPlayer` only wraps those routes. */
+export type PlayerRequest = SignatureRequest | StsRequest | ResolveUrlRequest;
 
 // Parsing into this context helps avoid multi copies of requests
 // since request body can only be read once.

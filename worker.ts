@@ -1,3 +1,4 @@
+/// <reference lib="deno.worker" />
 import { preprocessPlayer } from "./ejs/src/yt/solver/solvers.ts";
 
 self.onmessage = (e: MessageEvent<string>) => {

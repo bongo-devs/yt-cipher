@@ -2,7 +2,7 @@ import type { ApiRequest, RequestContext } from "./types.ts";
 
 type Next = (ctx: RequestContext) => Promise<Response>;
 type ValidationSchema = {
-    [key: string]: (value: any) => boolean;
+    [key: string]: (value: unknown) => boolean;
 };
 
 const signatureRequestSchema: ValidationSchema = {
@@ -18,10 +18,11 @@ const resolveUrlRequestSchema: ValidationSchema = {
     stream_url: (val) => typeof val === 'string',
 };
 
-function validateObject(obj: any, schema: ValidationSchema): { isValid: boolean, errors: string[] } {
+function validateObject(obj: ApiRequest, schema: ValidationSchema): { isValid: boolean, errors: string[] } {
     const errors: string[] = [];
+    const fields = obj as Record<string, unknown>;
     for (const key in schema) {
-        if (!obj.hasOwnProperty(key) || !schema[key](obj[key])) {
+        if (!Object.hasOwn(fields, key) || !schema[key](fields[key])) {
             errors.push(`'${key}' is missing or invalid`);
         }
     }
@@ -40,12 +41,10 @@ export function withValidation(handler: Next): Next {
         } else if (pathname === '/resolve_url') {
             schema = resolveUrlRequestSchema;
         } else {
-            return handler(ctx);
+            return await handler(ctx);
         }
-        
-        const body = ctx.body as ApiRequest;
 
-        const { isValid, errors } = validateObject(body, schema);
+        const { isValid, errors } = validateObject(ctx.body, schema);
 
         if (!isValid) {
             return new Response(JSON.stringify({ error: `Invalid request body: ${errors.join(', ')}` }), {
@@ -53,7 +52,7 @@ export function withValidation(handler: Next): Next {
                 headers: { "Content-Type": "application/json" },
             });
         }
-        
-        return handler(ctx);
+
+        return await handler(ctx);
     };
 }

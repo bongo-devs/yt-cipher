@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert";
+import { assertEquals } from "jsr:@std/assert@1.0.19";
 import { isSessionBound, visitorIdFrom } from "./potBinding.ts";
 import { cacheKey, reuseMs } from "./potPool.ts";
 
@@ -55,4 +55,25 @@ Deno.test("reuseMs is short only for content bound video tokens", () => {
   const session = reuseMs({ videoId: "one", client: "IOS" });
   assertEquals(content < session, true);
   assertEquals(reuseMs({ client: "WEB" }), session);
+});
+
+Deno.test("an explicit contentBinding overrides the client's usual binding", () => {
+  const tv = { visitorData: "v", videoId: "one", client: "TVHTML5" };
+
+  // TVHTML5 is session bound by name, so the living room nonce would otherwise be collapsed away.
+  assertEquals(
+    cacheKey({ ...tv, contentBinding: "AOT3D21LXcU=" }) ===
+      cacheKey({ ...tv, contentBinding: "5EkhLvrJp8Y=" }),
+    false,
+  );
+  assertEquals(
+    cacheKey({ ...tv, contentBinding: "AOT3D21LXcU=" }) === cacheKey(tv),
+    false,
+  );
+
+  // The nonce rotates per session, so its token must expire like a content bound one.
+  assertEquals(
+    reuseMs({ ...tv, contentBinding: "AOT3D21LXcU=" }),
+    reuseMs({ videoId: "one", client: "WEB" }),
+  );
 });

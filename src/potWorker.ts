@@ -5,16 +5,22 @@ interface MintRequest {
   visitorData?: string;
   videoId?: string;
   client?: string;
+  contentBinding?: string;
 }
 
 self.onmessage = async (e: MessageEvent<MintRequest>) => {
-  const { id, visitorData, videoId, client } = e.data;
+  const { id, visitorData, videoId, client, contentBinding } = e.data;
 
   try {
     self.postMessage({
       id,
       type: "success",
-      data: await potManager.generatePoToken(visitorData, videoId, client),
+      data: await potManager.generatePoToken(
+        visitorData,
+        videoId,
+        client,
+        contentBinding,
+      ),
     });
   } catch (error) {
     self.postMessage({
